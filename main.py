@@ -9,26 +9,14 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 SESSION_TTL_MINUTES = 20
-STATUS_PROGRESS = {
-    "validated": 10,
-    "scheduled": 25,
-    "tasking": 40,
-    "capturing": 60,
-    "processing": 80,
-    "ready": 95,
-    "delivered": 100,
-    "failed": 100,
-}
-STATUS_FLOW = [
-    "validated",
-    "scheduled",
-    "tasking",
-    "capturing",
-    "processing",
-    "ready",
-    "delivered",
-]
 SESSION_STARTED_AT = datetime.now(UTC)
+CUSTOMER_NAMES = [
+    "atlas-mining",
+    "civic-planning",
+    "relief-watch",
+    "northstar-energy",
+    "ocean-grid",
+]
 
 
 def utc_now() -> datetime:
@@ -40,8 +28,9 @@ def session_expiry() -> datetime:
 
 
 class Priority(str, Enum):
-    standard = "standard"
-    rush = "rush"
+    low = "low"
+    mid = "mid"
+    high = "high"
 
 
 class DeliveryFormat(str, Enum):
@@ -50,44 +39,19 @@ class DeliveryFormat(str, Enum):
     analytic_bundle = "analytic_bundle"
 
 
-class CollectionRequestStatus(str, Enum):
-    validated = "validated"
-    scheduled = "scheduled"
-    tasking = "tasking"
-    capturing = "capturing"
-    processing = "processing"
-    ready = "ready"
-    delivered = "delivered"
-    failed = "failed"
-
-
 class Sensor(BaseModel):
     id: str
-    constellation: str
-    modality: Literal["optical", "sar"]
-    resolution_m: float
-    max_taskable_area_sq_km: float
-    description: str
-
-
-class CustomerAccount(BaseModel):
-    id: str
     name: str
-    sector: str
-    region: str
-    default_policy_profile_id: str
+    resolution_m: float
+    max_taskable_sq_km: float
 
 
-class PolicyProfile(BaseModel):
-    id: str
-    label: str
-    description: str
-    max_aoi_sq_km: float
+class CustomerProfile(BaseModel):
+    customer_name: str
     allowed_sensor_ids: list[str]
-    max_cloud_cover_pct: int
-    allows_rush: bool
+    allowed_priorities: list[Priority]
     allowed_delivery_formats: list[DeliveryFormat]
-    max_window_days: int
+    max_aoi_sq_km: float
 
 
 class AreaOfInterest(BaseModel):
@@ -104,14 +68,12 @@ class PolicyViolation(BaseModel):
 
 
 class CollectionRequestInput(BaseModel):
-    customer_account_id: str
-    policy_profile_id: str
+    customer_name: str
     sensor_id: str
-    priority: Priority = Priority.standard
+    priority: Priority
     delivery_format: DeliveryFormat
     acquisition_window_start: datetime
     acquisition_window_end: datetime
-    cloud_cover_max_pct: int = Field(..., ge=0, le=100)
     area_of_interest: AreaOfInterest
 
 
@@ -120,29 +82,12 @@ class ValidationResult(BaseModel):
     violations: list[PolicyViolation]
 
 
-class CollectionRequestEvent(BaseModel):
-    at: datetime
-    status: CollectionRequestStatus
-    note: str
-
-
 class CollectionRequest(CollectionRequestInput):
     id: str
-    order_number: str
-    customer_name: str
-    status: CollectionRequestStatus
-    progress_pct: int = Field(..., ge=0, le=100)
-    expected_delivery_at: datetime
-    events: list[CollectionRequestEvent]
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
     source: Literal["seeded", "user"]
-
-
-class SimulateTickPayload(BaseModel):
-    target_status: CollectionRequestStatus | None = None
-    note: str | None = Field(default=None, max_length=240)
 
 
 class DeleteResult(BaseModel):
@@ -151,124 +96,94 @@ class DeleteResult(BaseModel):
     resource: Literal["collection_request"]
 
 
-POLICY_PROFILES: dict[str, PolicyProfile] = {}
 SENSORS: dict[str, Sensor] = {}
-CUSTOMER_ACCOUNTS: dict[str, CustomerAccount] = {}
+CUSTOMER_PROFILES: dict[str, CustomerProfile] = {}
 COLLECTION_REQUESTS: dict[str, CollectionRequest] = {}
 
 
 app = FastAPI(
     title="OrbitalOps Mock API",
-    summary="Mock satellite imagery ordering API for agent-tool assignments",
+    summary="Simple mock API for satellite collection requests",
     description=(
-        "A demo-friendly FastAPI service for validating and tracking short-lived "
-        "satellite collection requests."
+        "A demo-friendly FastAPI service for validating short-lived collection "
+        "requests against customer-specific policies."
     ),
-    version="1.1.0",
+    version="2.0.0",
 )
 
 
 def seed_reference_data() -> None:
-    global POLICY_PROFILES, SENSORS, CUSTOMER_ACCOUNTS
+    global SENSORS, CUSTOMER_PROFILES
 
     SENSORS = {
-        "aurora-optical-wide": Sensor(
-            id="aurora-optical-wide",
-            constellation="Aurora",
-            modality="optical",
-            resolution_m=1.5,
-            max_taskable_area_sq_km=900,
-            description="Fast revisit optical sensor for broad monitoring tasks.",
+        "sar-horizon-1": Sensor(
+            id="sar-horizon-1",
+            name="SAR Horizon 1",
+            resolution_m=0.5,
+            max_taskable_sq_km=120,
         ),
-        "aurora-optical-hd": Sensor(
-            id="aurora-optical-hd",
-            constellation="Aurora",
-            modality="optical",
-            resolution_m=0.35,
-            max_taskable_area_sq_km=120,
-            description="High-resolution optical tasking for detailed site monitoring.",
+        "sar-horizon-2": Sensor(
+            id="sar-horizon-2",
+            name="SAR Horizon 2",
+            resolution_m=1.0,
+            max_taskable_sq_km=300,
         ),
-        "nightwatch-sar": Sensor(
-            id="nightwatch-sar",
-            constellation="Nightwatch",
-            modality="sar",
-            resolution_m=0.8,
-            max_taskable_area_sq_km=700,
-            description="All-weather SAR sensor for low-visibility and night acquisitions.",
+        "sar-surveyor-1": Sensor(
+            id="sar-surveyor-1",
+            name="SAR Surveyor 1",
+            resolution_m=3.0,
+            max_taskable_sq_km=800,
         ),
     }
 
-    POLICY_PROFILES = {
-        "policy-commercial-standard": PolicyProfile(
-            id="policy-commercial-standard",
-            label="Commercial Standard",
-            description="Default commercial policy for routine monitoring programs.",
-            max_aoi_sq_km=250,
-            allowed_sensor_ids=["aurora-optical-wide", "nightwatch-sar"],
-            max_cloud_cover_pct=35,
-            allows_rush=False,
+    CUSTOMER_PROFILES = {
+        "atlas-mining": CustomerProfile(
+            customer_name="atlas-mining",
+            allowed_sensor_ids=["sar-horizon-1", "sar-horizon-2"],
+            allowed_priorities=[Priority.mid, Priority.high],
+            allowed_delivery_formats=[
+                DeliveryFormat.geotiff,
+                DeliveryFormat.analytic_bundle,
+            ],
+            max_aoi_sq_km=120,
+        ),
+        "civic-planning": CustomerProfile(
+            customer_name="civic-planning",
+            allowed_sensor_ids=["sar-horizon-2", "sar-surveyor-1"],
+            allowed_priorities=[Priority.low, Priority.mid],
             allowed_delivery_formats=[
                 DeliveryFormat.geotiff,
                 DeliveryFormat.png_tiles,
             ],
-            max_window_days=10,
+            max_aoi_sq_km=400,
         ),
-        "policy-commercial-priority": PolicyProfile(
-            id="policy-commercial-priority",
-            label="Commercial Priority",
-            description="Priority tasking policy for high-value commercial operations.",
-            max_aoi_sq_km=450,
-            allowed_sensor_ids=[
-                "aurora-optical-wide",
-                "aurora-optical-hd",
-                "nightwatch-sar",
+        "relief-watch": CustomerProfile(
+            customer_name="relief-watch",
+            allowed_sensor_ids=["sar-horizon-2", "sar-surveyor-1"],
+            allowed_priorities=[Priority.mid, Priority.high],
+            allowed_delivery_formats=[
+                DeliveryFormat.geotiff,
+                DeliveryFormat.png_tiles,
             ],
-            max_cloud_cover_pct=45,
-            allows_rush=True,
+            max_aoi_sq_km=600,
+        ),
+        "northstar-energy": CustomerProfile(
+            customer_name="northstar-energy",
+            allowed_sensor_ids=["sar-horizon-1", "sar-surveyor-1"],
+            allowed_priorities=[Priority.low, Priority.mid, Priority.high],
             allowed_delivery_formats=[
                 DeliveryFormat.geotiff,
                 DeliveryFormat.png_tiles,
                 DeliveryFormat.analytic_bundle,
             ],
-            max_window_days=14,
+            max_aoi_sq_km=250,
         ),
-        "policy-humanitarian-response": PolicyProfile(
-            id="policy-humanitarian-response",
-            label="Humanitarian Response",
-            description="Rapid response imagery policy for humanitarian field teams.",
-            max_aoi_sq_km=600,
-            allowed_sensor_ids=["aurora-optical-wide", "nightwatch-sar"],
-            max_cloud_cover_pct=60,
-            allows_rush=True,
-            allowed_delivery_formats=[
-                DeliveryFormat.geotiff,
-                DeliveryFormat.png_tiles,
-            ],
-            max_window_days=7,
-        ),
-    }
-
-    CUSTOMER_ACCOUNTS = {
-        "acct-atlas-mining": CustomerAccount(
-            id="acct-atlas-mining",
-            name="Atlas Mining Group",
-            sector="Mining",
-            region="Latin America",
-            default_policy_profile_id="policy-commercial-priority",
-        ),
-        "acct-civic-planning": CustomerAccount(
-            id="acct-civic-planning",
-            name="Civic Planning Office",
-            sector="Public Sector",
-            region="Southern Europe",
-            default_policy_profile_id="policy-commercial-standard",
-        ),
-        "acct-relief-watch": CustomerAccount(
-            id="acct-relief-watch",
-            name="Relief Watch",
-            sector="Humanitarian",
-            region="Global",
-            default_policy_profile_id="policy-humanitarian-response",
+        "ocean-grid": CustomerProfile(
+            customer_name="ocean-grid",
+            allowed_sensor_ids=["sar-surveyor-1"],
+            allowed_priorities=[Priority.low],
+            allowed_delivery_formats=[DeliveryFormat.png_tiles],
+            max_aoi_sq_km=700,
         ),
     }
 
@@ -277,26 +192,18 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
     now = utc_now()
     violations: list[PolicyViolation] = []
 
-    customer = CUSTOMER_ACCOUNTS.get(payload.customer_account_id)
-    policy = POLICY_PROFILES.get(payload.policy_profile_id)
+    if payload.customer_name not in CUSTOMER_NAMES:
+        violations.append(
+            PolicyViolation(
+                code="UNKNOWN_CUSTOMER_NAME",
+                message="Customer name is not recognized.",
+                field="customer_name",
+            )
+        )
+
+    profile = CUSTOMER_PROFILES.get(payload.customer_name)
     sensor = SENSORS.get(payload.sensor_id)
 
-    if customer is None:
-        violations.append(
-            PolicyViolation(
-                code="UNKNOWN_CUSTOMER",
-                message="Customer account does not exist.",
-                field="customer_account_id",
-            )
-        )
-    if policy is None:
-        violations.append(
-            PolicyViolation(
-                code="UNKNOWN_POLICY",
-                message="Policy profile does not exist.",
-                field="policy_profile_id",
-            )
-        )
     if sensor is None:
         violations.append(
             PolicyViolation(
@@ -306,75 +213,62 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
             )
         )
 
-    if customer and policy and customer.default_policy_profile_id != policy.id:
+    if profile is None:
         violations.append(
             PolicyViolation(
-                code="POLICY_NOT_ASSIGNED",
-                message=(
-                    f"{customer.name} must use policy "
-                    f"{customer.default_policy_profile_id}."
-                ),
-                field="policy_profile_id",
+                code="MISSING_CUSTOMER_PROFILE",
+                message="Customer profile is not configured.",
+                field="customer_name",
             )
         )
 
-    if policy and sensor and sensor.id not in policy.allowed_sensor_ids:
+    if profile and payload.sensor_id not in profile.allowed_sensor_ids:
         violations.append(
             PolicyViolation(
                 code="SENSOR_NOT_ALLOWED",
-                message=f"Sensor {sensor.id} is not allowed by this policy.",
+                message="This sensor is not allowed for the selected customer.",
                 field="sensor_id",
             )
         )
 
-    if policy and payload.area_of_interest.area_sq_km > policy.max_aoi_sq_km:
+    if profile and payload.priority not in profile.allowed_priorities:
         violations.append(
             PolicyViolation(
-                code="AOI_TOO_LARGE",
-                message=f"AOI exceeds the policy limit of {policy.max_aoi_sq_km} sq km.",
-                field="area_of_interest.area_sq_km",
-            )
-        )
-
-    if sensor and payload.area_of_interest.area_sq_km > sensor.max_taskable_area_sq_km:
-        violations.append(
-            PolicyViolation(
-                code="SENSOR_AOI_LIMIT_EXCEEDED",
-                message=(
-                    f"Sensor {sensor.id} cannot task an AOI larger than "
-                    f"{sensor.max_taskable_area_sq_km} sq km."
-                ),
-                field="area_of_interest.area_sq_km",
-            )
-        )
-
-    if policy and payload.cloud_cover_max_pct > policy.max_cloud_cover_pct:
-        violations.append(
-            PolicyViolation(
-                code="CLOUD_COVER_TOO_HIGH",
-                message=(
-                    "Requested cloud cover threshold exceeds the policy maximum of "
-                    f"{policy.max_cloud_cover_pct}%."
-                ),
-                field="cloud_cover_max_pct",
-            )
-        )
-
-    if policy and payload.priority is Priority.rush and not policy.allows_rush:
-        violations.append(
-            PolicyViolation(
-                code="RUSH_NOT_ALLOWED",
-                message="Rush tasking is not allowed under this policy.",
+                code="PRIORITY_NOT_ALLOWED",
+                message="This priority is not allowed for the selected customer.",
                 field="priority",
             )
         )
 
-    if policy and payload.delivery_format not in policy.allowed_delivery_formats:
+    if profile and payload.delivery_format not in profile.allowed_delivery_formats:
         violations.append(
             PolicyViolation(
                 code="FORMAT_NOT_ALLOWED",
-                message="Requested delivery format is not allowed under this policy.",
+                message="This delivery format is not allowed for the selected customer.",
                 field="delivery_format",
+            )
+        )
+
+    if profile and payload.area_of_interest.area_sq_km > profile.max_aoi_sq_km:
+        violations.append(
+            PolicyViolation(
+                code="AOI_TOO_LARGE",
+                message=(
+                    f"AOI exceeds the customer profile limit of {profile.max_aoi_sq_km} sq km."
+                ),
+                field="area_of_interest.area_sq_km",
+            )
+        )
+
+    if sensor and payload.area_of_interest.area_sq_km > sensor.max_taskable_sq_km:
+        violations.append(
+            PolicyViolation(
+                code="SENSOR_AOI_LIMIT_EXCEEDED",
+                message=(
+                    f"Sensor {payload.sensor_id} cannot task an AOI larger than "
+                    f"{sensor.max_taskable_sq_km} sq km."
+                ),
+                field="area_of_interest.area_sq_km",
             )
         )
 
@@ -396,19 +290,14 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
             )
         )
 
-    if policy:
-        horizon = now + timedelta(days=policy.max_window_days)
-        if payload.acquisition_window_end > horizon:
-            violations.append(
-                PolicyViolation(
-                    code="WINDOW_TOO_FAR_OUT",
-                    message=(
-                        "Acquisition window exceeds the policy planning horizon of "
-                        f"{policy.max_window_days} days."
-                    ),
-                    field="acquisition_window_end",
-                )
+    if payload.acquisition_window_end > now + timedelta(days=14):
+        violations.append(
+            PolicyViolation(
+                code="WINDOW_TOO_FAR_OUT",
+                message="Acquisition window must end within 14 days.",
+                field="acquisition_window_end",
             )
+        )
 
     return ValidationResult(allowed=not violations, violations=violations)
 
@@ -417,87 +306,19 @@ def build_collection_request(
     payload: CollectionRequestInput,
     *,
     request_id: str | None = None,
-    order_number: str | None = None,
-    status_value: CollectionRequestStatus = CollectionRequestStatus.validated,
     source: Literal["seeded", "user"],
     created_at: datetime | None = None,
-    updated_at: datetime | None = None,
     expires_at: datetime | None = None,
-    note: str | None = None,
-    events: list[CollectionRequestEvent] | None = None,
 ) -> CollectionRequest:
     created = created_at or utc_now()
-    updated = updated_at or created
-    customer = CUSTOMER_ACCOUNTS[payload.customer_account_id]
-    request_events = events or [
-        CollectionRequestEvent(
-            at=created,
-            status=status_value,
-            note=note or "Collection request validated and accepted into the workflow.",
-        )
-    ]
     return CollectionRequest(
         id=request_id or f"cr_{uuid4().hex[:10]}",
-        order_number=order_number or f"OO-{created.strftime('%Y%m%d')}-{uuid4().hex[:4].upper()}",
-        customer_name=customer.name,
-        status=status_value,
-        progress_pct=STATUS_PROGRESS[status_value.value],
-        expected_delivery_at=payload.acquisition_window_end + timedelta(hours=12),
-        events=request_events,
         created_at=created,
-        updated_at=updated,
+        updated_at=created,
         expires_at=expires_at or session_expiry(),
         source=source,
         **payload.model_dump(),
     )
-
-
-def advance_collection_request(
-    collection_request: CollectionRequest,
-    target_status: CollectionRequestStatus | None = None,
-    note: str | None = None,
-) -> CollectionRequest:
-    if collection_request.status is CollectionRequestStatus.failed:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Failed collection requests cannot be advanced.",
-        )
-
-    if (
-        collection_request.status is CollectionRequestStatus.delivered
-        and target_status is None
-    ):
-        return collection_request
-
-    current_index = STATUS_FLOW.index(collection_request.status.value)
-    next_status = target_status
-
-    if next_status is None:
-        if current_index >= len(STATUS_FLOW) - 1:
-            return collection_request
-        next_status = CollectionRequestStatus(STATUS_FLOW[current_index + 1])
-
-    if next_status is CollectionRequestStatus.failed:
-        collection_request.status = CollectionRequestStatus.failed
-    elif STATUS_FLOW.index(next_status.value) <= current_index:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Target status must be ahead of the current collection request status.",
-        )
-    else:
-        collection_request.status = next_status
-
-    collection_request.progress_pct = STATUS_PROGRESS[collection_request.status.value]
-    collection_request.updated_at = utc_now()
-    collection_request.expires_at = session_expiry()
-    collection_request.events.append(
-        CollectionRequestEvent(
-            at=collection_request.updated_at,
-            status=collection_request.status,
-            note=note or f"Collection request advanced to {collection_request.status.value}.",
-        )
-    )
-    return collection_request
 
 
 def cleanup_expired_records() -> None:
@@ -528,123 +349,60 @@ def seed_session_data() -> None:
     COLLECTION_REQUESTS = {}
     now = utc_now()
 
-    request_one = build_collection_request(
+    seeded_payloads = [
         CollectionRequestInput(
-            customer_account_id="acct-civic-planning",
-            policy_profile_id="policy-commercial-standard",
-            sensor_id="aurora-optical-wide",
-            priority=Priority.standard,
+            customer_name="civic-planning",
+            sensor_id="sar-surveyor-1",
+            priority=Priority.low,
             delivery_format=DeliveryFormat.png_tiles,
             acquisition_window_start=now + timedelta(hours=6),
-            acquisition_window_end=now + timedelta(days=1, hours=6),
-            cloud_cover_max_pct=20,
+            acquisition_window_end=now + timedelta(days=1),
             area_of_interest=AreaOfInterest(
-                name="Seville expansion corridor",
+                name="Seville ring road",
                 center_lat=37.3891,
                 center_lon=-5.9845,
-                area_sq_km=85,
+                area_sq_km=140,
             ),
         ),
-        request_id="cr_demo_001",
-        order_number="OO-DEMO-001",
-        status_value=CollectionRequestStatus.ready,
-        source="seeded",
-        created_at=now - timedelta(minutes=9),
-        updated_at=now - timedelta(minutes=2),
-        expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
-        events=[
-            CollectionRequestEvent(
-                at=now - timedelta(minutes=9),
-                status=CollectionRequestStatus.validated,
-                note="Seeded request accepted for routine urban planning coverage.",
-            ),
-            CollectionRequestEvent(
-                at=now - timedelta(minutes=7),
-                status=CollectionRequestStatus.processing,
-                note="Imagery ingested and queued for analyst review.",
-            ),
-            CollectionRequestEvent(
-                at=now - timedelta(minutes=2),
-                status=CollectionRequestStatus.ready,
-                note="Products are ready for delivery to the planning dashboard.",
-            ),
-        ],
-    )
-
-    request_two = build_collection_request(
         CollectionRequestInput(
-            customer_account_id="acct-atlas-mining",
-            policy_profile_id="policy-commercial-priority",
-            sensor_id="aurora-optical-hd",
-            priority=Priority.rush,
+            customer_name="atlas-mining",
+            sensor_id="sar-horizon-1",
+            priority=Priority.high,
             delivery_format=DeliveryFormat.analytic_bundle,
-            acquisition_window_start=now + timedelta(hours=2),
-            acquisition_window_end=now + timedelta(hours=16),
-            cloud_cover_max_pct=30,
+            acquisition_window_start=now + timedelta(hours=3),
+            acquisition_window_end=now + timedelta(hours=18),
             area_of_interest=AreaOfInterest(
-                name="Atacama pit expansion",
+                name="Atacama pit north wall",
                 center_lat=-22.9108,
                 center_lon=-68.1997,
-                area_sq_km=42,
+                area_sq_km=65,
             ),
         ),
-        request_id="cr_demo_002",
-        order_number="OO-DEMO-002",
-        status_value=CollectionRequestStatus.capturing,
-        source="seeded",
-        created_at=now - timedelta(minutes=6),
-        updated_at=now - timedelta(minutes=1),
-        expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
-        events=[
-            CollectionRequestEvent(
-                at=now - timedelta(minutes=6),
-                status=CollectionRequestStatus.validated,
-                note="Priority mining task accepted under the commercial priority policy.",
-            ),
-            CollectionRequestEvent(
-                at=now - timedelta(minutes=4),
-                status=CollectionRequestStatus.tasking,
-                note="Spacecraft reservation approved for next available pass.",
-            ),
-            CollectionRequestEvent(
-                at=now - timedelta(minutes=1),
-                status=CollectionRequestStatus.capturing,
-                note="Constellation is actively acquiring imagery for the site.",
-            ),
-        ],
-    )
-
-    request_three = build_collection_request(
         CollectionRequestInput(
-            customer_account_id="acct-relief-watch",
-            policy_profile_id="policy-humanitarian-response",
-            sensor_id="nightwatch-sar",
-            priority=Priority.rush,
+            customer_name="relief-watch",
+            sensor_id="sar-horizon-2",
+            priority=Priority.high,
             delivery_format=DeliveryFormat.geotiff,
-            acquisition_window_start=now + timedelta(hours=1),
-            acquisition_window_end=now + timedelta(hours=10),
-            cloud_cover_max_pct=55,
+            acquisition_window_start=now + timedelta(hours=2),
+            acquisition_window_end=now + timedelta(hours=12),
             area_of_interest=AreaOfInterest(
                 name="Floodplain north sector",
                 center_lat=14.5995,
                 center_lon=120.9842,
-                area_sq_km=160,
+                area_sq_km=210,
             ),
         ),
-        request_id="cr_demo_003",
-        order_number="OO-DEMO-003",
-        status_value=CollectionRequestStatus.validated,
-        source="seeded",
-        created_at=now - timedelta(minutes=4),
-        updated_at=now - timedelta(minutes=4),
-        expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
-        note="Humanitarian response request validated and waiting for scheduling.",
-    )
+    ]
 
     COLLECTION_REQUESTS = {
-        request_one.id: request_one,
-        request_two.id: request_two,
-        request_three.id: request_three,
+        f"cr_demo_{index:03d}": build_collection_request(
+            payload,
+            request_id=f"cr_demo_{index:03d}",
+            source="seeded",
+            created_at=now - timedelta(minutes=10 - index),
+            expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+        )
+        for index, payload in enumerate(seeded_payloads, start=1)
     }
 
 
@@ -661,12 +419,12 @@ def root() -> dict[str, object]:
     cleanup_expired_records()
     return {
         "service": "OrbitalOps Mock API",
-        "purpose": "Demo API for agent-tool assignments around satellite imagery ordering.",
+        "purpose": "Simple demo API for validating satellite collection requests.",
         "session_started_at": SESSION_STARTED_AT,
         "session_ttl_minutes": SESSION_TTL_MINUTES,
         "counts": {
-            "policy_profiles": len(POLICY_PROFILES),
-            "customer_accounts": len(CUSTOMER_ACCOUNTS),
+            "customer_names": len(CUSTOMER_NAMES),
+            "customer_profiles": len(CUSTOMER_PROFILES),
             "sensors": len(SENSORS),
             "collection_requests": len(COLLECTION_REQUESTS),
         },
@@ -674,21 +432,21 @@ def root() -> dict[str, object]:
             "interactive_docs": "/docs",
             "openapi": "/openapi.json",
             "assignment_docs": "/docs/assignment",
-            "policy_profiles": "/policy-profiles",
-            "customer_accounts": "/customer-accounts",
+            "customer_names": "/customer-names",
+            "customer_profiles": "/customer-profiles",
             "sensors": "/sensors",
         },
     }
 
 
-@app.get("/policy-profiles", response_model=list[PolicyProfile])
-def list_policy_profiles() -> list[PolicyProfile]:
-    return list(POLICY_PROFILES.values())
+@app.get("/customer-names", response_model=list[str])
+def list_customer_names() -> list[str]:
+    return CUSTOMER_NAMES
 
 
-@app.get("/customer-accounts", response_model=list[CustomerAccount])
-def list_customer_accounts() -> list[CustomerAccount]:
-    return list(CUSTOMER_ACCOUNTS.values())
+@app.get("/customer-profiles", response_model=list[CustomerProfile])
+def list_customer_profiles() -> list[CustomerProfile]:
+    return list(CUSTOMER_PROFILES.values())
 
 
 @app.get("/sensors", response_model=list[Sensor])
@@ -752,91 +510,80 @@ def delete_collection_request(collection_request_id: str) -> DeleteResult:
     )
 
 
-@app.post(
-    "/collection-requests/{collection_request_id}/simulate-tick",
-    response_model=CollectionRequest,
-)
-def simulate_tick(
-    collection_request_id: str,
-    payload: SimulateTickPayload | None = None,
-) -> CollectionRequest:
-    collection_request = get_collection_request_or_404(collection_request_id)
-    return advance_collection_request(
-        collection_request,
-        target_status=payload.target_status if payload else None,
-        note=payload.note if payload else None,
-    )
-
-
 @app.get("/docs/assignment")
 def assignment_docs() -> dict[str, object]:
     return {
         "title": "OrbitalOps assignment guide",
         "overview": (
-            "This API simulates a satellite constellation company that validates and "
-            "tracks collection requests as a single workflow object."
+            "This API simulates a satellite company with simple customer-specific "
+            "policies. Collection requests are either accepted or rejected."
         ),
         "objects": {
-            "policy_profiles": {
+            "customer_names": {
                 "mutable": False,
-                "purpose": "Read-only policy rules that gate what each customer may request.",
-            },
-            "customer_accounts": {
-                "mutable": False,
-                "purpose": "Read-only commercial accounts mapped to a default policy profile.",
+                "purpose": "The fixed set of allowed customer names.",
             },
             "sensors": {
                 "mutable": False,
-                "purpose": "Read-only sensor catalog describing the imaging assets candidates can task.",
+                "purpose": "The fixed set of SAR sensors candidates can choose from.",
+            },
+            "customer_profiles": {
+                "mutable": False,
+                "purpose": (
+                    "Per-customer policies describing allowed sensors, priorities, "
+                    "delivery formats, and AOI limits."
+                ),
             },
             "collection_requests": {
                 "mutable": True,
-                "purpose": (
-                    "A collection request is the main workflow object. It includes the "
-                    "commercial tracking fields that would normally live on an order."
-                ),
+                "purpose": "Short-lived collection requests that are only created if policy validation passes.",
             },
         },
-        "relationships": [
-            "A customer account is assigned to a single policy profile.",
-            "A collection request chooses one sensor from the read-only sensor catalog.",
-            "A collection request must use the customer account's assigned policy profile.",
-            "Collection requests move through an order-like lifecycle for demos and dashboards.",
-            "Reference data is immutable, while collection requests are session-scoped and mutable.",
-        ],
         "known_values": {
             "priority": [priority.value for priority in Priority],
             "delivery_format": [delivery_format.value for delivery_format in DeliveryFormat],
-            "collection_request_status": [
-                request_status.value for request_status in CollectionRequestStatus
-            ],
+        },
+        "relationships": [
+            "Each customer name has exactly one customer profile.",
+            "A collection request must use a known customer name.",
+            "The chosen sensor, priority, and delivery format must all be allowed by that customer's profile.",
+            "The AOI must fit both the customer profile limit and the sensor tasking limit.",
+        ],
+        "collection_request_input": {
+            "required_fields": [
+                "customer_name",
+                "sensor_id",
+                "priority",
+                "delivery_format",
+                "acquisition_window_start",
+                "acquisition_window_end",
+                "area_of_interest",
+            ]
         },
         "mutable_session_data": {
             "ttl_minutes": SESSION_TTL_MINUTES,
             "notes": [
                 "Seeded collection requests are loaded when the app starts.",
                 "Collection requests may be deleted or replaced during the exercise.",
-                "Reference data is hardcoded and exposed as read-only catalog data.",
+                "Reference objects are immutable and should be treated as catalog data.",
             ],
         },
         "starter_validation_examples": [
             {
-                "name": "rush_not_allowed",
-                "description": "Fails because Civic Planning uses the standard policy and standard policy does not allow rush.",
+                "name": "priority_not_allowed",
+                "description": "Fails because ocean-grid only allows low priority.",
                 "payload": {
-                    "customer_account_id": "acct-civic-planning",
-                    "policy_profile_id": "policy-commercial-standard",
-                    "sensor_id": "aurora-optical-wide",
-                    "priority": "rush",
+                    "customer_name": "ocean-grid",
+                    "sensor_id": "sar-surveyor-1",
+                    "priority": "high",
                     "delivery_format": "png_tiles",
                     "acquisition_window_start": (utc_now() + timedelta(hours=5)).isoformat(),
                     "acquisition_window_end": (utc_now() + timedelta(days=1)).isoformat(),
-                    "cloud_cover_max_pct": 20,
                     "area_of_interest": {
-                        "name": "Seville emergency corridor",
-                        "center_lat": 37.38,
-                        "center_lon": -5.99,
-                        "area_sq_km": 95,
+                        "name": "North Atlantic cable route",
+                        "center_lat": 48.85,
+                        "center_lon": -27.12,
+                        "area_sq_km": 300,
                     },
                 },
             }
@@ -844,7 +591,7 @@ def assignment_docs() -> dict[str, object]:
         "workflow": [
             {
                 "step": 1,
-                "action": "Inspect /policy-profiles, /customer-accounts, and /sensors to discover the allowed business context.",
+                "action": "Inspect /customer-names, /customer-profiles, and /sensors to understand the fixed catalog.",
             },
             {
                 "step": 2,
@@ -856,24 +603,19 @@ def assignment_docs() -> dict[str, object]:
             },
             {
                 "step": 4,
-                "action": "Track progress with GET /collection-requests/{collection_request_id}.",
-            },
-            {
-                "step": 5,
-                "action": "Advance status with POST /collection-requests/{collection_request_id}/simulate-tick.",
+                "action": "List or fetch created requests with GET /collection-requests or GET /collection-requests/{collection_request_id}.",
             },
         ],
         "endpoints": [
             {"method": "GET", "path": "/", "description": "Service summary and useful links."},
-            {"method": "GET", "path": "/policy-profiles", "description": "List policy profiles."},
-            {"method": "GET", "path": "/customer-accounts", "description": "List customer accounts and their default policy assignments."},
-            {"method": "GET", "path": "/sensors", "description": "List available imaging sensors."},
+            {"method": "GET", "path": "/customer-names", "description": "List allowed customer names."},
+            {"method": "GET", "path": "/customer-profiles", "description": "List per-customer policy profiles."},
+            {"method": "GET", "path": "/sensors", "description": "List available SAR sensors."},
             {"method": "POST", "path": "/collection-requests/validate", "description": "Validate a collection request without persisting it."},
             {"method": "GET", "path": "/collection-requests", "description": "List session-scoped collection requests."},
             {"method": "POST", "path": "/collection-requests", "description": "Persist a policy-compliant collection request."},
-            {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request including workflow status."},
+            {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request."},
             {"method": "DELETE", "path": "/collection-requests/{collection_request_id}", "description": "Delete a session collection request."},
-            {"method": "POST", "path": "/collection-requests/{collection_request_id}/simulate-tick", "description": "Advance a collection request through the demo lifecycle."},
         ],
         "starter_demo_records": {
             "collection_request_ids": sorted(COLLECTION_REQUESTS.keys()),

@@ -1,6 +1,6 @@
 # OrbitalOps Mock API
 
-This repository contains a mock FastAPI backend for a job assignment. It simulates a satellite constellation company that validates imagery collection requests and tracks their progress for dashboards or agent-driven workflows.
+This repository contains a mock FastAPI backend for a job assignment. It simulates a satellite company that validates SAR imagery collection requests against simple customer-specific policies.
 
 The API is designed for candidates building agents or tools that must:
 
@@ -8,28 +8,27 @@ The API is designed for candidates building agents or tools that must:
 - reason about object relationships
 - validate policy constraints before creation
 - create and mutate session data
-- track order status over time
 
 ## Domain Model
 
 The API centers on one main workflow object plus reference data:
 
-- `PolicyProfile`: read-only business rules that determine what a customer may request
-- `CustomerAccount`: read-only customer metadata with an assigned default policy
-- `Sensor`: read-only imaging asset metadata
-- `CollectionRequest`: the main workflow object, combining imagery tasking details with status, progress, and event history
+- `customer_name`: a fixed enum-like list of 5 allowed customer strings
+- `Sensor`: one of 3 SAR sensors with a name, resolution, and max taskable area
+- `CustomerProfile`: per-customer policy rules describing allowed sensors, priorities, delivery formats, and max AOI
+- `CollectionRequest`: the only mutable business object, created only if it complies with policy
 
 Relationship flow:
 
-`PolicyProfile` -> validates `CollectionRequest`
+`customer_name` -> `CustomerProfile` -> validates `CollectionRequest`
 
 ## Seeded Data
 
 The service starts with two kinds of data:
 
 - immutable reference data:
-  - policy profiles
-  - customer accounts
+  - customer names
+  - customer profiles
   - sensors
 - mutable session data:
   - seeded collection requests
@@ -52,8 +51,8 @@ This makes it a good fit for assignment demos on Render, but not for durable pro
 - `GET /`
   Returns a service summary and links to the docs endpoints.
 
-- `GET /policy-profiles`
-- `GET /customer-accounts`
+- `GET /customer-names`
+- `GET /customer-profiles`
 - `GET /sensors`
   Inspect the read-only business objects and allowed business rules.
 
@@ -66,9 +65,6 @@ This makes it a good fit for assignment demos on Render, but not for durable pro
 - `DELETE /collection-requests/{collection_request_id}`
   Manage session-scoped collection requests.
 
-- `POST /collection-requests/{collection_request_id}/simulate-tick`
-  Advance a collection request through its demo lifecycle.
-
 - `GET /docs/assignment`
   Assignment-specific documentation describing the API suite, object relationships, and recommended workflow.
 
@@ -76,37 +72,16 @@ This makes it a good fit for assignment demos on Render, but not for durable pro
 - `GET /openapi.json`
   FastAPI-generated interactive docs and OpenAPI schema.
 
-## Collection Request Lifecycle
-
-Collection requests move through a dashboard-friendly status flow:
-
-- `validated`
-- `scheduled`
-- `tasking`
-- `capturing`
-- `processing`
-- `ready`
-- `delivered`
-- `failed`
-
-Each collection request includes:
-
-- current status
-- progress percentage
-- timestamps
-- an event timeline
-- an order-style tracking number
-
 ## Policy Validation
 
 Collection requests are checked against policy before they can be persisted.
 
 Example validation rules include:
 
-- customer must use the correct assigned policy profile
+- customer name must exist
 - requested sensor must be allowed by the policy
 - AOI size must be within policy and sensor limits
-- rush priority may be restricted
+- priority may be restricted
 - delivery format may be restricted
 - acquisition windows must be valid and near-term
 
@@ -116,9 +91,8 @@ Validation responses return structured violations with machine-readable codes so
 
 These values are also exposed in `GET /docs/assignment`.
 
-- `Priority`: `standard`, `rush`
+- `Priority`: `low`, `mid`, `high`
 - `DeliveryFormat`: `geotiff`, `png_tiles`, `analytic_bundle`
-- `CollectionRequestStatus`: `validated`, `scheduled`, `tasking`, `capturing`, `processing`, `ready`, `delivered`, `failed`
 
 ## Local Development
 
@@ -137,11 +111,10 @@ The app will then be available at:
 
 ## Example Workflow
 
-1. Call `GET /policy-profiles`, `GET /customer-accounts`, and `GET /sensors` to inspect the catalog.
+1. Call `GET /customer-names`, `GET /customer-profiles`, and `GET /sensors` to inspect the catalog.
 2. Call `POST /collection-requests/validate` with a proposed request.
 3. Create a valid request with `POST /collection-requests`.
-4. Poll `GET /collection-requests/{collection_request_id}`.
-5. Advance it with `POST /collection-requests/{collection_request_id}/simulate-tick`.
+4. Fetch or delete it with `GET /collection-requests/{collection_request_id}` or `DELETE /collection-requests/{collection_request_id}`.
 
 ## Render Deployment
 
