@@ -92,7 +92,7 @@ Example validation rules include:
 - each AOI deterministically maps to an `acquisition_time`
 - a collection request is only feasible if that `acquisition_time` falls inside the requested acquisition window
 - the normal validate endpoint does not check database conflicts
-- creation is rejected if another stored collection request has an `acquisition_time` within 10 minutes
+- creation is rejected if another stored collection request has an `acquisition_time` within 1 hour
 
 Validation responses return structured violations with machine-readable codes so candidates can build agents that react intelligently to errors.
 

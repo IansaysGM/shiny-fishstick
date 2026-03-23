@@ -678,7 +678,7 @@ def assignment_docs() -> dict[str, object]:
             "The AOI must fit the selected sensor tasking limit.",
             "The AOI coordinates deterministically map to an acquisition_time modulo 24 hours.",
             "A collection request is only feasible when that acquisition_time falls within the requested acquisition window.",
-            "A collection request cannot be created if another stored request has an acquisition_time within 10 minutes of it.",
+            "A collection request cannot be created if another stored request has an acquisition_time within 1 hour of it.",
         ],
         "collection_request_input": {
             "required_fields": [
