@@ -51,7 +51,6 @@ class CustomerProfile(BaseModel):
     allowed_sensor_ids: list[str]
     allowed_priorities: list[Priority]
     allowed_delivery_formats: list[DeliveryFormat]
-    max_aoi_sq_km: float
 
 
 class AreaOfInterest(BaseModel):
@@ -177,7 +176,6 @@ def seed_reference_data() -> None:
                 DeliveryFormat.geotiff,
                 DeliveryFormat.analytic_bundle,
             ],
-            max_aoi_sq_km=120,
         ),
         "civic-planning": CustomerProfile(
             customer_name="civic-planning",
@@ -187,7 +185,6 @@ def seed_reference_data() -> None:
                 DeliveryFormat.geotiff,
                 DeliveryFormat.png_tiles,
             ],
-            max_aoi_sq_km=400,
         ),
         "relief-watch": CustomerProfile(
             customer_name="relief-watch",
@@ -197,7 +194,6 @@ def seed_reference_data() -> None:
                 DeliveryFormat.geotiff,
                 DeliveryFormat.png_tiles,
             ],
-            max_aoi_sq_km=600,
         ),
         "northstar-energy": CustomerProfile(
             customer_name="northstar-energy",
@@ -208,14 +204,12 @@ def seed_reference_data() -> None:
                 DeliveryFormat.png_tiles,
                 DeliveryFormat.analytic_bundle,
             ],
-            max_aoi_sq_km=250,
         ),
         "ocean-grid": CustomerProfile(
             customer_name="ocean-grid",
             allowed_sensor_ids=["sar-surveyor-1"],
             allowed_priorities=[Priority.low],
             allowed_delivery_formats=[DeliveryFormat.png_tiles],
-            max_aoi_sq_km=700,
         ),
     }
 
@@ -279,17 +273,6 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
                 code="FORMAT_NOT_ALLOWED",
                 message="This delivery format is not allowed for the selected customer.",
                 field="delivery_format",
-            )
-        )
-
-    if profile and payload.area_of_interest.area_sq_km > profile.max_aoi_sq_km:
-        violations.append(
-            PolicyViolation(
-                code="AOI_TOO_LARGE",
-                message=(
-                    f"AOI exceeds the customer profile limit of {profile.max_aoi_sq_km} sq km."
-                ),
-                field="area_of_interest.area_sq_km",
             )
         )
 
@@ -672,7 +655,7 @@ def assignment_docs() -> dict[str, object]:
                 "mutable": False,
                 "purpose": (
                     "Per-customer policies describing allowed sensors, priorities, "
-                    "delivery formats, and AOI limits."
+                    "and delivery formats."
                 ),
             },
             "collection_requests": {
@@ -692,7 +675,7 @@ def assignment_docs() -> dict[str, object]:
             "Each customer name has exactly one customer profile.",
             "A collection request must use a known customer name.",
             "The chosen sensor, priority, and delivery format must all be allowed by that customer's profile.",
-            "The AOI must fit both the customer profile limit and the sensor tasking limit.",
+            "The AOI must fit the selected sensor tasking limit.",
             "The AOI coordinates deterministically map to an acquisition_time modulo 24 hours.",
             "A collection request is only feasible when that acquisition_time falls within the requested acquisition window.",
             "A collection request cannot be created if another stored request has an acquisition_time within 10 minutes of it.",
@@ -761,7 +744,7 @@ def assignment_docs() -> dict[str, object]:
             },
             {
                 "name": "conflict_example",
-                "description": "May conflict with an existing seeded collection request if the computed acquisition_time is within 10 minutes.",
+                "description": "May conflict with an existing seeded collection request if the computed acquisition_time is within 1 hour.",
                 "payload": {
                     "customer_name": "civic-planning",
                     "sensor_id": "sar-surveyor-1",
@@ -806,7 +789,7 @@ def assignment_docs() -> dict[str, object]:
             {"method": "GET", "path": "/customer-profiles", "description": "List per-customer policy profiles."},
             {"method": "GET", "path": "/sensors", "description": "List available SAR sensors."},
             {"method": "POST", "path": "/collection-requests/validate", "description": "Validate a collection request without persisting it."},
-            {"method": "POST", "path": "/collection-requests/conflict-validation", "description": "Return existing collection requests whose acquisition_time conflicts within 10 minutes."},
+            {"method": "POST", "path": "/collection-requests/conflict-validation", "description": "Return existing collection requests whose acquisition_time conflicts within 1 hour of it."},
             {"method": "GET", "path": "/collection-requests", "description": "List session-scoped collection requests."},
             {"method": "POST", "path": "/collection-requests", "description": "Persist a policy-compliant collection request."},
             {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request."},

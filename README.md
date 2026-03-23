@@ -15,7 +15,7 @@ The API centers on one main workflow object plus reference data:
 
 - `customer_name`: a fixed enum-like list of 5 allowed customer strings
 - `Sensor`: one of 3 SAR sensors with a name, resolution, and max taskable area
-- `CustomerProfile`: per-customer policy rules describing allowed sensors, priorities, delivery formats, and max AOI
+- `CustomerProfile`: per-customer policy rules describing allowed sensors, priorities, and delivery formats
 - `CollectionRequest`: the only mutable business object, created only if it complies with policy
 
 Relationship flow:
@@ -60,7 +60,7 @@ This makes it a good fit for assignment demos on Render, but not for durable pro
   Validate a proposed collection request without persisting it.
 
 - `POST /collection-requests/conflict-validation`
-  Return stored collection requests whose `acquisition_time` conflicts within 10 minutes.
+  Return stored collection requests whose `acquisition_time` conflicts within 1 hour.
 
 - `GET /collection-requests`
 - `POST /collection-requests`
@@ -84,7 +84,7 @@ Example validation rules include:
 
 - customer name must exist
 - requested sensor must be allowed by the policy
-- AOI size must be within policy and sensor limits
+- AOI size must be within the selected sensor limit
 - priority may be restricted
 - delivery format may be restricted
 - acquisition windows must be valid and near-term
