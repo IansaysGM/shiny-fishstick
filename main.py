@@ -123,6 +123,11 @@ class ResetResult(BaseModel):
     collection_request_ids: list[str]
 
 
+class ConflictValidationResult(BaseModel):
+    acquisition_time: datetime
+    conflicts: list[CollectionRequest]
+
+
 SENSORS: dict[str, Sensor] = {}
 CUSTOMER_PROFILES: dict[str, CustomerProfile] = {}
 COLLECTION_REQUESTS: dict[str, CollectionRequest] = {}
@@ -405,6 +410,25 @@ def get_collection_request_or_404(collection_request_id: str) -> CollectionReque
     return collection_request
 
 
+def find_conflicting_collection_requests(
+    payload: CollectionRequestInput,
+) -> tuple[datetime, list[CollectionRequest]]:
+    acquisition_time = compute_acquisition_time(
+        payload.area_of_interest,
+        payload.acquisition_window_start,
+    )
+    conflicts = [
+        collection_request
+        for collection_request in COLLECTION_REQUESTS.values()
+        if abs(
+            (collection_request.acquisition_time - acquisition_time).total_seconds()
+        )
+        <= 3600
+    ]
+    conflicts.sort(key=lambda collection_request: collection_request.acquisition_time)
+    return acquisition_time, conflicts
+
+
 def seed_session_data() -> None:
     global COLLECTION_REQUESTS
 
@@ -536,6 +560,19 @@ def validate_request(payload: CollectionRequestInput) -> ValidationResult:
     return validate_collection_request(payload)
 
 
+@app.post(
+    "/collection-requests/conflict-validation",
+    response_model=ConflictValidationResult,
+)
+def conflict_validate_request(payload: CollectionRequestInput) -> ConflictValidationResult:
+    cleanup_expired_records()
+    acquisition_time, conflicts = find_conflicting_collection_requests(payload)
+    return ConflictValidationResult(
+        acquisition_time=acquisition_time,
+        conflicts=conflicts,
+    )
+
+
 @app.get("/collection-requests", response_model=list[CollectionRequest])
 def list_collection_requests() -> list[CollectionRequest]:
     cleanup_expired_records()
@@ -560,6 +597,22 @@ def create_collection_request(payload: CollectionRequestInput) -> CollectionRequ
             detail={
                 "message": "Collection request failed policy validation.",
                 "violations": [violation.model_dump() for violation in validation.violations],
+            },
+        )
+
+    acquisition_time, conflicts = find_conflicting_collection_requests(payload)
+    if conflicts:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    "Collection request conflicts with an existing request whose "
+                    "acquisition_time is within 1 hour."
+                ),
+                "acquisition_time": acquisition_time.isoformat(),
+                "conflicting_collection_requests": [
+                    conflict.model_dump(mode="json") for conflict in conflicts
+                ],
             },
         )
 
@@ -642,6 +695,7 @@ def assignment_docs() -> dict[str, object]:
             "The AOI must fit both the customer profile limit and the sensor tasking limit.",
             "The AOI coordinates deterministically map to an acquisition_time modulo 24 hours.",
             "A collection request is only feasible when that acquisition_time falls within the requested acquisition window.",
+            "A collection request cannot be created if another stored request has an acquisition_time within 10 minutes of it.",
         ],
         "collection_request_input": {
             "required_fields": [
@@ -656,6 +710,8 @@ def assignment_docs() -> dict[str, object]:
             "rules": [
                 "The acquisition window cannot be larger than 24 hours.",
                 "Validation returns acquisition_time so clients can explain feasibility decisions.",
+                "The standard validate endpoint does not check conflicts with existing collection requests.",
+                "Conflict checks are exposed separately and are enforced during creation.",
             ],
         },
         "mutable_session_data": {
@@ -703,8 +759,26 @@ def assignment_docs() -> dict[str, object]:
                     },
                 },
             },
+            {
+                "name": "conflict_example",
+                "description": "May conflict with an existing seeded collection request if the computed acquisition_time is within 10 minutes.",
+                "payload": {
+                    "customer_name": "civic-planning",
+                    "sensor_id": "sar-surveyor-1",
+                    "priority": "low",
+                    "delivery_format": "png_tiles",
+                    "acquisition_window_start": (utc_now() + timedelta(hours=1)).isoformat(),
+                    "acquisition_window_end": (utc_now() + timedelta(hours=20)).isoformat(),
+                    "area_of_interest": {
+                        "name": "Seville ring road variant",
+                        "center_lat": 37.3892,
+                        "center_lon": -5.9844,
+                        "area_sq_km": 140,
+                    },
+                },
+            },
         ],
-        "workflow": [
+        "workflow_example": [
             {
                 "step": 1,
                 "action": "Inspect /customer-names, /customer-profiles, and /sensors to understand the fixed catalog.",
@@ -719,6 +793,10 @@ def assignment_docs() -> dict[str, object]:
             },
             {
                 "step": 4,
+                "action": "call POST /collection-requests/conflict-validation to inspect acquisition_time conflicts with stored requests.",
+            },
+            {
+                "step": 5,
                 "action": "List or fetch created requests with GET /collection-requests or GET /collection-requests/{collection_request_id}.",
             },
         ],
@@ -728,6 +806,7 @@ def assignment_docs() -> dict[str, object]:
             {"method": "GET", "path": "/customer-profiles", "description": "List per-customer policy profiles."},
             {"method": "GET", "path": "/sensors", "description": "List available SAR sensors."},
             {"method": "POST", "path": "/collection-requests/validate", "description": "Validate a collection request without persisting it."},
+            {"method": "POST", "path": "/collection-requests/conflict-validation", "description": "Return existing collection requests whose acquisition_time conflicts within 10 minutes."},
             {"method": "GET", "path": "/collection-requests", "description": "List session-scoped collection requests."},
             {"method": "POST", "path": "/collection-requests", "description": "Persist a policy-compliant collection request."},
             {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request."},

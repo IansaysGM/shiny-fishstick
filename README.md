@@ -59,6 +59,9 @@ This makes it a good fit for assignment demos on Render, but not for durable pro
 - `POST /collection-requests/validate`
   Validate a proposed collection request without persisting it.
 
+- `POST /collection-requests/conflict-validation`
+  Return stored collection requests whose `acquisition_time` conflicts within 10 minutes.
+
 - `GET /collection-requests`
 - `POST /collection-requests`
 - `GET /collection-requests/{collection_request_id}`
@@ -88,6 +91,8 @@ Example validation rules include:
 - acquisition windows cannot be larger than 24 hours
 - each AOI deterministically maps to an `acquisition_time`
 - a collection request is only feasible if that `acquisition_time` falls inside the requested acquisition window
+- the normal validate endpoint does not check database conflicts
+- creation is rejected if another stored collection request has an `acquisition_time` within 10 minutes
 
 Validation responses return structured violations with machine-readable codes so candidates can build agents that react intelligently to errors.
 
@@ -119,9 +124,10 @@ The app will then be available at:
 
 1. Call `GET /customer-names`, `GET /customer-profiles`, and `GET /sensors` to inspect the catalog.
 2. Call `POST /collection-requests/validate` with a proposed request.
-3. Create a valid request with `POST /collection-requests`.
-4. Fetch or delete it with `GET /collection-requests/{collection_request_id}` or `DELETE /collection-requests/{collection_request_id}`.
-5. Restore the seeded dataset with `POST /collection-requests/reset`.
+3. Optionally call `POST /collection-requests/conflict-validation` to inspect acquisition-time conflicts with existing requests.
+4. Create a valid non-conflicting request with `POST /collection-requests`.
+5. Fetch or delete it with `GET /collection-requests/{collection_request_id}` or `DELETE /collection-requests/{collection_request_id}`.
+6. Restore the seeded dataset with `POST /collection-requests/reset`.
 
 ## Render Deployment
 
