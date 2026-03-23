@@ -61,6 +61,25 @@ class AreaOfInterest(BaseModel):
     area_sq_km: float = Field(..., gt=0, le=2500)
 
 
+def compute_daily_acquisition_offset(area_of_interest: AreaOfInterest) -> timedelta:
+    lat_ratio = (area_of_interest.center_lat + 90) / 180
+    lon_ratio = (area_of_interest.center_lon + 180) / 360
+    offset_seconds = int((((lat_ratio * 0.65) + (lon_ratio * 0.35)) % 1) * 86400)
+    return timedelta(seconds=offset_seconds)
+
+
+def compute_acquisition_time(
+    area_of_interest: AreaOfInterest,
+    acquisition_window_start: datetime,
+) -> datetime:
+    start_utc = acquisition_window_start.astimezone(UTC)
+    base_day = start_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    acquisition_time = base_day + compute_daily_acquisition_offset(area_of_interest)
+    if acquisition_time < start_utc:
+        acquisition_time += timedelta(days=1)
+    return acquisition_time
+
+
 class PolicyViolation(BaseModel):
     code: str
     message: str
@@ -79,11 +98,13 @@ class CollectionRequestInput(BaseModel):
 
 class ValidationResult(BaseModel):
     allowed: bool
+    acquisition_time: datetime | None = None
     violations: list[PolicyViolation]
 
 
 class CollectionRequest(CollectionRequestInput):
     id: str
+    acquisition_time: datetime
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
@@ -94,6 +115,12 @@ class DeleteResult(BaseModel):
     deleted: bool
     id: str
     resource: Literal["collection_request"]
+
+
+class ResetResult(BaseModel):
+    reset: bool
+    collection_request_count: int
+    collection_request_ids: list[str]
 
 
 SENSORS: dict[str, Sensor] = {}
@@ -191,6 +218,7 @@ def seed_reference_data() -> None:
 def validate_collection_request(payload: CollectionRequestInput) -> ValidationResult:
     now = utc_now()
     violations: list[PolicyViolation] = []
+    acquisition_time: datetime | None = None
 
     if payload.customer_name not in CUSTOMER_NAMES:
         violations.append(
@@ -281,6 +309,15 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
             )
         )
 
+    if payload.acquisition_window_end - payload.acquisition_window_start > timedelta(hours=24):
+        violations.append(
+            PolicyViolation(
+                code="WINDOW_TOO_LARGE",
+                message="Acquisition window cannot be larger than 24 hours.",
+                field="acquisition_window_end",
+            )
+        )
+
     if payload.acquisition_window_start < now:
         violations.append(
             PolicyViolation(
@@ -299,7 +336,27 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
             )
         )
 
-    return ValidationResult(allowed=not violations, violations=violations)
+    if payload.acquisition_window_start < payload.acquisition_window_end:
+        acquisition_time = compute_acquisition_time(
+            payload.area_of_interest,
+            payload.acquisition_window_start,
+        )
+        if acquisition_time > payload.acquisition_window_end:
+            violations.append(
+                PolicyViolation(
+                    code="COLLECTION_REQUEST_NOT_FEASIBLE",
+                    message=(
+                        "Computed acquisition_time falls outside the acquisition window."
+                    ),
+                    field="acquisition_window_end",
+                )
+            )
+
+    return ValidationResult(
+        allowed=not violations,
+        acquisition_time=acquisition_time,
+        violations=violations,
+    )
 
 
 def build_collection_request(
@@ -311,8 +368,13 @@ def build_collection_request(
     expires_at: datetime | None = None,
 ) -> CollectionRequest:
     created = created_at or utc_now()
+    acquisition_time = compute_acquisition_time(
+        payload.area_of_interest,
+        payload.acquisition_window_start,
+    )
     return CollectionRequest(
         id=request_id or f"cr_{uuid4().hex[:10]}",
+        acquisition_time=acquisition_time,
         created_at=created,
         updated_at=created,
         expires_at=expires_at or session_expiry(),
@@ -349,14 +411,32 @@ def seed_session_data() -> None:
     COLLECTION_REQUESTS = {}
     now = utc_now()
 
+    def make_seeded_input(
+        *,
+        customer_name: str,
+        sensor_id: str,
+        priority: Priority,
+        delivery_format: DeliveryFormat,
+        area_of_interest: AreaOfInterest,
+    ) -> CollectionRequestInput:
+        base_window_start = now + timedelta(hours=2)
+        acquisition_time = compute_acquisition_time(area_of_interest, base_window_start)
+        return CollectionRequestInput(
+            customer_name=customer_name,
+            sensor_id=sensor_id,
+            priority=priority,
+            delivery_format=delivery_format,
+            acquisition_window_start=acquisition_time - timedelta(hours=1),
+            acquisition_window_end=acquisition_time + timedelta(hours=8),
+            area_of_interest=area_of_interest,
+        )
+
     seeded_payloads = [
-        CollectionRequestInput(
+        make_seeded_input(
             customer_name="civic-planning",
             sensor_id="sar-surveyor-1",
             priority=Priority.low,
             delivery_format=DeliveryFormat.png_tiles,
-            acquisition_window_start=now + timedelta(hours=6),
-            acquisition_window_end=now + timedelta(days=1),
             area_of_interest=AreaOfInterest(
                 name="Seville ring road",
                 center_lat=37.3891,
@@ -364,13 +444,11 @@ def seed_session_data() -> None:
                 area_sq_km=140,
             ),
         ),
-        CollectionRequestInput(
+        make_seeded_input(
             customer_name="atlas-mining",
             sensor_id="sar-horizon-1",
             priority=Priority.high,
             delivery_format=DeliveryFormat.analytic_bundle,
-            acquisition_window_start=now + timedelta(hours=3),
-            acquisition_window_end=now + timedelta(hours=18),
             area_of_interest=AreaOfInterest(
                 name="Atacama pit north wall",
                 center_lat=-22.9108,
@@ -378,13 +456,11 @@ def seed_session_data() -> None:
                 area_sq_km=65,
             ),
         ),
-        CollectionRequestInput(
+        make_seeded_input(
             customer_name="relief-watch",
             sensor_id="sar-horizon-2",
             priority=Priority.high,
             delivery_format=DeliveryFormat.geotiff,
-            acquisition_window_start=now + timedelta(hours=2),
-            acquisition_window_end=now + timedelta(hours=12),
             area_of_interest=AreaOfInterest(
                 name="Floodplain north sector",
                 center_lat=14.5995,
@@ -435,6 +511,7 @@ def root() -> dict[str, object]:
             "customer_names": "/customer-names",
             "customer_profiles": "/customer-profiles",
             "sensors": "/sensors",
+            "reset_collection_requests": "/collection-requests/reset",
         },
     }
 
@@ -510,13 +587,24 @@ def delete_collection_request(collection_request_id: str) -> DeleteResult:
     )
 
 
+@app.post("/collection-requests/reset", response_model=ResetResult)
+def reset_collection_requests() -> ResetResult:
+    seed_session_data()
+    return ResetResult(
+        reset=True,
+        collection_request_count=len(COLLECTION_REQUESTS),
+        collection_request_ids=sorted(COLLECTION_REQUESTS.keys()),
+    )
+
+
 @app.get("/docs/assignment")
 def assignment_docs() -> dict[str, object]:
     return {
         "title": "OrbitalOps assignment guide",
         "overview": (
             "This API simulates a satellite company with simple customer-specific "
-            "policies. Collection requests are either accepted or rejected."
+            "policies. Collection requests are either accepted or rejected based on "
+            "policy and acquisition feasibility."
         ),
         "objects": {
             "customer_names": {
@@ -536,7 +624,11 @@ def assignment_docs() -> dict[str, object]:
             },
             "collection_requests": {
                 "mutable": True,
-                "purpose": "Short-lived collection requests that are only created if policy validation passes.",
+                "purpose": (
+                    "Short-lived collection requests that are only created if policy "
+                    "validation passes. Created records include a deterministic "
+                    "acquisition_time derived from the AOI coordinates."
+                ),
             },
         },
         "known_values": {
@@ -548,6 +640,8 @@ def assignment_docs() -> dict[str, object]:
             "A collection request must use a known customer name.",
             "The chosen sensor, priority, and delivery format must all be allowed by that customer's profile.",
             "The AOI must fit both the customer profile limit and the sensor tasking limit.",
+            "The AOI coordinates deterministically map to an acquisition_time modulo 24 hours.",
+            "A collection request is only feasible when that acquisition_time falls within the requested acquisition window.",
         ],
         "collection_request_input": {
             "required_fields": [
@@ -558,7 +652,11 @@ def assignment_docs() -> dict[str, object]:
                 "acquisition_window_start",
                 "acquisition_window_end",
                 "area_of_interest",
-            ]
+            ],
+            "rules": [
+                "The acquisition window cannot be larger than 24 hours.",
+                "Validation returns acquisition_time so clients can explain feasibility decisions.",
+            ],
         },
         "mutable_session_data": {
             "ttl_minutes": SESSION_TTL_MINUTES,
@@ -586,7 +684,25 @@ def assignment_docs() -> dict[str, object]:
                         "area_sq_km": 300,
                     },
                 },
-            }
+            },
+            {
+                "name": "collection_request_not_feasible",
+                "description": "Fails because the computed acquisition_time falls outside the requested acquisition window.",
+                "payload": {
+                    "customer_name": "northstar-energy",
+                    "sensor_id": "sar-horizon-1",
+                    "priority": "mid",
+                    "delivery_format": "geotiff",
+                    "acquisition_window_start": (utc_now() + timedelta(hours=2)).isoformat(),
+                    "acquisition_window_end": (utc_now() + timedelta(hours=3)).isoformat(),
+                    "area_of_interest": {
+                        "name": "Remote compressor station",
+                        "center_lat": 29.76,
+                        "center_lon": -95.36,
+                        "area_sq_km": 80,
+                    },
+                },
+            },
         ],
         "workflow": [
             {
@@ -616,6 +732,7 @@ def assignment_docs() -> dict[str, object]:
             {"method": "POST", "path": "/collection-requests", "description": "Persist a policy-compliant collection request."},
             {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request."},
             {"method": "DELETE", "path": "/collection-requests/{collection_request_id}", "description": "Delete a session collection request."},
+            {"method": "POST", "path": "/collection-requests/reset", "description": "Reset the collection request list back to the seeded demo records."},
         ],
         "starter_demo_records": {
             "collection_request_ids": sorted(COLLECTION_REQUESTS.keys()),

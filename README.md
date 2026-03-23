@@ -63,6 +63,7 @@ This makes it a good fit for assignment demos on Render, but not for durable pro
 - `POST /collection-requests`
 - `GET /collection-requests/{collection_request_id}`
 - `DELETE /collection-requests/{collection_request_id}`
+- `POST /collection-requests/reset`
   Manage session-scoped collection requests.
 
 - `GET /docs/assignment`
@@ -84,8 +85,13 @@ Example validation rules include:
 - priority may be restricted
 - delivery format may be restricted
 - acquisition windows must be valid and near-term
+- acquisition windows cannot be larger than 24 hours
+- each AOI deterministically maps to an `acquisition_time`
+- a collection request is only feasible if that `acquisition_time` falls inside the requested acquisition window
 
 Validation responses return structured violations with machine-readable codes so candidates can build agents that react intelligently to errors.
+
+Created collection requests also include an `acquisition_time` field. It is derived from the AOI coordinates modulo 24 hours, so the same AOI always produces the same acquisition time-of-day.
 
 ## Known Enum Values
 
@@ -115,6 +121,7 @@ The app will then be available at:
 2. Call `POST /collection-requests/validate` with a proposed request.
 3. Create a valid request with `POST /collection-requests`.
 4. Fetch or delete it with `GET /collection-requests/{collection_request_id}` or `DELETE /collection-requests/{collection_request_id}`.
+5. Restore the seeded dataset with `POST /collection-requests/reset`.
 
 ## Render Deployment
 
