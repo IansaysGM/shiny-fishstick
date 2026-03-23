@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 SESSION_TTL_MINUTES = 20
-ORDER_PROGRESS = {
+STATUS_PROGRESS = {
     "validated": 10,
     "scheduled": 25,
     "tasking": 40,
@@ -19,7 +19,7 @@ ORDER_PROGRESS = {
     "delivered": 100,
     "failed": 100,
 }
-ORDER_FLOW = [
+STATUS_FLOW = [
     "validated",
     "scheduled",
     "tasking",
@@ -50,7 +50,7 @@ class DeliveryFormat(str, Enum):
     analytic_bundle = "analytic_bundle"
 
 
-class OrderStatus(str, Enum):
+class CollectionRequestStatus(str, Enum):
     validated = "validated"
     scheduled = "scheduled"
     tasking = "tasking"
@@ -120,73 +120,51 @@ class ValidationResult(BaseModel):
     violations: list[PolicyViolation]
 
 
-class CollectionRequest(CollectionRequestInput):
-    id: str
-    status: Literal["approved"] = "approved"
-    created_at: datetime
-    updated_at: datetime
-    expires_at: datetime
-    source: Literal["seeded", "user"]
-
-
-class OrderEvent(BaseModel):
+class CollectionRequestEvent(BaseModel):
     at: datetime
-    status: OrderStatus
+    status: CollectionRequestStatus
     note: str
 
 
-class Order(BaseModel):
+class CollectionRequest(CollectionRequestInput):
     id: str
     order_number: str
-    collection_request_id: str
-    customer_account_id: str
     customer_name: str
-    policy_profile_id: str
-    sensor_id: str
-    priority: Priority
-    status: OrderStatus
+    status: CollectionRequestStatus
     progress_pct: int = Field(..., ge=0, le=100)
+    expected_delivery_at: datetime
+    events: list[CollectionRequestEvent]
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
-    expected_delivery_at: datetime
     source: Literal["seeded", "user"]
-    request_snapshot: CollectionRequest
-    events: list[OrderEvent]
-
-
-class CreateOrderPayload(BaseModel):
-    collection_request_id: str
-    requested_by: str = Field(..., min_length=2, max_length=80)
-    note: str | None = Field(default=None, max_length=240)
 
 
 class SimulateTickPayload(BaseModel):
-    target_status: OrderStatus | None = None
+    target_status: CollectionRequestStatus | None = None
     note: str | None = Field(default=None, max_length=240)
 
 
 class DeleteResult(BaseModel):
     deleted: bool
     id: str
-    resource: Literal["collection_request", "order"]
+    resource: Literal["collection_request"]
 
 
 POLICY_PROFILES: dict[str, PolicyProfile] = {}
 SENSORS: dict[str, Sensor] = {}
 CUSTOMER_ACCOUNTS: dict[str, CustomerAccount] = {}
 COLLECTION_REQUESTS: dict[str, CollectionRequest] = {}
-ORDERS: dict[str, Order] = {}
 
 
 app = FastAPI(
     title="OrbitalOps Mock API",
     summary="Mock satellite imagery ordering API for agent-tool assignments",
     description=(
-        "A demo-friendly FastAPI service for validating satellite collection requests, "
-        "creating short-lived orders, and tracking order progress."
+        "A demo-friendly FastAPI service for validating and tracking short-lived "
+        "satellite collection requests."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -353,9 +331,7 @@ def validate_collection_request(payload: CollectionRequestInput) -> ValidationRe
         violations.append(
             PolicyViolation(
                 code="AOI_TOO_LARGE",
-                message=(
-                    f"AOI exceeds the policy limit of {policy.max_aoi_sq_km} sq km."
-                ),
+                message=f"AOI exceeds the policy limit of {policy.max_aoi_sq_km} sq km.",
                 field="area_of_interest.area_sq_km",
             )
         )
@@ -441,130 +417,98 @@ def build_collection_request(
     payload: CollectionRequestInput,
     *,
     request_id: str | None = None,
+    order_number: str | None = None,
+    status_value: CollectionRequestStatus = CollectionRequestStatus.validated,
     source: Literal["seeded", "user"],
     created_at: datetime | None = None,
+    updated_at: datetime | None = None,
     expires_at: datetime | None = None,
+    note: str | None = None,
+    events: list[CollectionRequestEvent] | None = None,
 ) -> CollectionRequest:
     created = created_at or utc_now()
-    expiry = expires_at or session_expiry()
+    updated = updated_at or created
+    customer = CUSTOMER_ACCOUNTS[payload.customer_account_id]
+    request_events = events or [
+        CollectionRequestEvent(
+            at=created,
+            status=status_value,
+            note=note or "Collection request validated and accepted into the workflow.",
+        )
+    ]
     return CollectionRequest(
         id=request_id or f"cr_{uuid4().hex[:10]}",
+        order_number=order_number or f"OO-{created.strftime('%Y%m%d')}-{uuid4().hex[:4].upper()}",
+        customer_name=customer.name,
+        status=status_value,
+        progress_pct=STATUS_PROGRESS[status_value.value],
+        expected_delivery_at=payload.acquisition_window_end + timedelta(hours=12),
+        events=request_events,
         created_at=created,
-        updated_at=created,
-        expires_at=expiry,
+        updated_at=updated,
+        expires_at=expires_at or session_expiry(),
         source=source,
         **payload.model_dump(),
     )
 
 
-def build_order(
+def advance_collection_request(
     collection_request: CollectionRequest,
-    *,
-    order_id: str | None = None,
-    order_number: str | None = None,
-    status_value: OrderStatus = OrderStatus.validated,
-    source: Literal["seeded", "user"],
-    created_at: datetime | None = None,
-    requested_by: str | None = None,
+    target_status: CollectionRequestStatus | None = None,
     note: str | None = None,
-) -> Order:
-    created = created_at or utc_now()
-    customer = CUSTOMER_ACCOUNTS[collection_request.customer_account_id]
-    events = [
-        OrderEvent(
-            at=created,
-            status=status_value,
-            note=note or f"Order created by {requested_by or 'system seed'}",
-        )
-    ]
-    return Order(
-        id=order_id or f"ord_{uuid4().hex[:10]}",
-        order_number=order_number or f"OO-{created.strftime('%Y%m%d')}-{uuid4().hex[:4].upper()}",
-        collection_request_id=collection_request.id,
-        customer_account_id=customer.id,
-        customer_name=customer.name,
-        policy_profile_id=collection_request.policy_profile_id,
-        sensor_id=collection_request.sensor_id,
-        priority=collection_request.priority,
-        status=status_value,
-        progress_pct=ORDER_PROGRESS[status_value.value],
-        created_at=created,
-        updated_at=created,
-        expires_at=session_expiry(),
-        expected_delivery_at=collection_request.acquisition_window_end + timedelta(hours=12),
-        source=source,
-        request_snapshot=collection_request.model_copy(deep=True),
-        events=events,
-    )
-
-
-def collection_request_input_from_record(
-    collection_request: CollectionRequest,
-) -> CollectionRequestInput:
-    return CollectionRequestInput(
-        **collection_request.model_dump(
-            exclude={"id", "status", "created_at", "updated_at", "expires_at", "source"}
-        )
-    )
-
-
-def advance_order(order: Order, target_status: OrderStatus | None = None, note: str | None = None) -> Order:
-    if order.status is OrderStatus.failed:
+) -> CollectionRequest:
+    if collection_request.status is CollectionRequestStatus.failed:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Failed orders cannot be advanced.",
+            detail="Failed collection requests cannot be advanced.",
         )
 
-    if order.status is OrderStatus.delivered and target_status is None:
-        return order
+    if (
+        collection_request.status is CollectionRequestStatus.delivered
+        and target_status is None
+    ):
+        return collection_request
 
-    current_index = ORDER_FLOW.index(order.status.value)
+    current_index = STATUS_FLOW.index(collection_request.status.value)
     next_status = target_status
 
     if next_status is None:
-        if current_index >= len(ORDER_FLOW) - 1:
-            return order
-        next_status = OrderStatus(ORDER_FLOW[current_index + 1])
+        if current_index >= len(STATUS_FLOW) - 1:
+            return collection_request
+        next_status = CollectionRequestStatus(STATUS_FLOW[current_index + 1])
 
-    if next_status is OrderStatus.failed:
-        order.status = OrderStatus.failed
-    elif ORDER_FLOW.index(next_status.value) <= current_index:
+    if next_status is CollectionRequestStatus.failed:
+        collection_request.status = CollectionRequestStatus.failed
+    elif STATUS_FLOW.index(next_status.value) <= current_index:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Target status must be ahead of the current order status.",
+            detail="Target status must be ahead of the current collection request status.",
         )
     else:
-        order.status = next_status
+        collection_request.status = next_status
 
-    order.progress_pct = ORDER_PROGRESS[order.status.value]
-    order.updated_at = utc_now()
-    order.expires_at = session_expiry()
-    order.events.append(
-        OrderEvent(
-            at=order.updated_at,
-            status=order.status,
-            note=note or f"Order advanced to {order.status.value}.",
+    collection_request.progress_pct = STATUS_PROGRESS[collection_request.status.value]
+    collection_request.updated_at = utc_now()
+    collection_request.expires_at = session_expiry()
+    collection_request.events.append(
+        CollectionRequestEvent(
+            at=collection_request.updated_at,
+            status=collection_request.status,
+            note=note or f"Collection request advanced to {collection_request.status.value}.",
         )
     )
-    return order
+    return collection_request
 
 
 def cleanup_expired_records() -> None:
     now = utc_now()
-    expired_requests = [
+    expired_request_ids = [
         request_id
         for request_id, collection_request in COLLECTION_REQUESTS.items()
         if collection_request.expires_at <= now
     ]
-    expired_orders = [
-        order_id
-        for order_id, order in ORDERS.items()
-        if order.expires_at <= now
-    ]
-    for request_id in expired_requests:
+    for request_id in expired_request_ids:
         del COLLECTION_REQUESTS[request_id]
-    for order_id in expired_orders:
-        del ORDERS[order_id]
 
 
 def get_collection_request_or_404(collection_request_id: str) -> CollectionRequest:
@@ -578,23 +522,10 @@ def get_collection_request_or_404(collection_request_id: str) -> CollectionReque
     return collection_request
 
 
-def get_order_or_404(order_id: str) -> Order:
-    cleanup_expired_records()
-    order = ORDERS.get(order_id)
-    if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found.",
-        )
-    return order
-
-
 def seed_session_data() -> None:
-    global COLLECTION_REQUESTS, ORDERS
+    global COLLECTION_REQUESTS
 
     COLLECTION_REQUESTS = {}
-    ORDERS = {}
-
     now = utc_now()
 
     request_one = build_collection_request(
@@ -615,10 +546,31 @@ def seed_session_data() -> None:
             ),
         ),
         request_id="cr_demo_001",
+        order_number="OO-DEMO-001",
+        status_value=CollectionRequestStatus.ready,
         source="seeded",
         created_at=now - timedelta(minutes=9),
+        updated_at=now - timedelta(minutes=2),
         expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+        events=[
+            CollectionRequestEvent(
+                at=now - timedelta(minutes=9),
+                status=CollectionRequestStatus.validated,
+                note="Seeded request accepted for routine urban planning coverage.",
+            ),
+            CollectionRequestEvent(
+                at=now - timedelta(minutes=7),
+                status=CollectionRequestStatus.processing,
+                note="Imagery ingested and queued for analyst review.",
+            ),
+            CollectionRequestEvent(
+                at=now - timedelta(minutes=2),
+                status=CollectionRequestStatus.ready,
+                note="Products are ready for delivery to the planning dashboard.",
+            ),
+        ],
     )
+
     request_two = build_collection_request(
         CollectionRequestInput(
             customer_account_id="acct-atlas-mining",
@@ -637,10 +589,31 @@ def seed_session_data() -> None:
             ),
         ),
         request_id="cr_demo_002",
+        order_number="OO-DEMO-002",
+        status_value=CollectionRequestStatus.capturing,
         source="seeded",
         created_at=now - timedelta(minutes=6),
+        updated_at=now - timedelta(minutes=1),
         expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+        events=[
+            CollectionRequestEvent(
+                at=now - timedelta(minutes=6),
+                status=CollectionRequestStatus.validated,
+                note="Priority mining task accepted under the commercial priority policy.",
+            ),
+            CollectionRequestEvent(
+                at=now - timedelta(minutes=4),
+                status=CollectionRequestStatus.tasking,
+                note="Spacecraft reservation approved for next available pass.",
+            ),
+            CollectionRequestEvent(
+                at=now - timedelta(minutes=1),
+                status=CollectionRequestStatus.capturing,
+                note="Constellation is actively acquiring imagery for the site.",
+            ),
+        ],
     )
+
     request_three = build_collection_request(
         CollectionRequestInput(
             customer_account_id="acct-relief-watch",
@@ -659,50 +632,19 @@ def seed_session_data() -> None:
             ),
         ),
         request_id="cr_demo_003",
+        order_number="OO-DEMO-003",
+        status_value=CollectionRequestStatus.validated,
         source="seeded",
         created_at=now - timedelta(minutes=4),
+        updated_at=now - timedelta(minutes=4),
         expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+        note="Humanitarian response request validated and waiting for scheduling.",
     )
 
     COLLECTION_REQUESTS = {
         request_one.id: request_one,
         request_two.id: request_two,
         request_three.id: request_three,
-    }
-
-    order_one = build_order(
-        request_one,
-        order_id="ord_demo_001",
-        order_number="OO-DEMO-001",
-        status_value=OrderStatus.processing,
-        source="seeded",
-        created_at=now - timedelta(minutes=8),
-        note="Seeded demo order moved into processing for dashboard demos.",
-    )
-    order_one.events.append(
-        OrderEvent(
-            at=now - timedelta(minutes=7),
-            status=OrderStatus.ready,
-            note="Analyst review queued after image ingest.",
-        )
-    )
-    order_one.status = OrderStatus.ready
-    order_one.progress_pct = ORDER_PROGRESS[OrderStatus.ready.value]
-    order_one.updated_at = now - timedelta(minutes=2)
-
-    order_two = build_order(
-        request_two,
-        order_id="ord_demo_002",
-        order_number="OO-DEMO-002",
-        status_value=OrderStatus.capturing,
-        source="seeded",
-        created_at=now - timedelta(minutes=5),
-        note="Priority mining request is actively being tasked.",
-    )
-
-    ORDERS = {
-        order_one.id: order_one,
-        order_two.id: order_two,
     }
 
 
@@ -727,46 +669,15 @@ def root() -> dict[str, object]:
             "customer_accounts": len(CUSTOMER_ACCOUNTS),
             "sensors": len(SENSORS),
             "collection_requests": len(COLLECTION_REQUESTS),
-            "orders": len(ORDERS),
         },
         "links": {
             "interactive_docs": "/docs",
             "openapi": "/openapi.json",
             "assignment_docs": "/docs/assignment",
-            "reference_data": "/reference-data",
+            "policy_profiles": "/policy-profiles",
+            "customer_accounts": "/customer-accounts",
+            "sensors": "/sensors",
         },
-    }
-
-
-@app.get("/reference-data")
-def get_reference_data() -> dict[str, object]:
-    return {
-        "read_only": True,
-        "policy_profiles": list(POLICY_PROFILES.values()),
-        "customer_accounts": list(CUSTOMER_ACCOUNTS.values()),
-        "sensors": list(SENSORS.values()),
-        "starter_validation_examples": [
-            {
-                "name": "rush_not_allowed",
-                "description": "Fails because Civic Planning can only use the standard policy and standard policy does not allow rush.",
-                "payload": {
-                    "customer_account_id": "acct-civic-planning",
-                    "policy_profile_id": "policy-commercial-standard",
-                    "sensor_id": "aurora-optical-wide",
-                    "priority": "rush",
-                    "delivery_format": "png_tiles",
-                    "acquisition_window_start": (utc_now() + timedelta(hours=5)).isoformat(),
-                    "acquisition_window_end": (utc_now() + timedelta(days=1)).isoformat(),
-                    "cloud_cover_max_pct": 20,
-                    "area_of_interest": {
-                        "name": "Seville emergency corridor",
-                        "center_lat": 37.38,
-                        "center_lon": -5.99,
-                        "area_sq_km": 95,
-                    },
-                },
-            }
-        ],
     }
 
 
@@ -775,15 +686,14 @@ def list_policy_profiles() -> list[PolicyProfile]:
     return list(POLICY_PROFILES.values())
 
 
-@app.get("/policy-profiles/{policy_id}", response_model=PolicyProfile)
-def get_policy_profile(policy_id: str) -> PolicyProfile:
-    policy = POLICY_PROFILES.get(policy_id)
-    if policy is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Policy profile not found.",
-        )
-    return policy
+@app.get("/customer-accounts", response_model=list[CustomerAccount])
+def list_customer_accounts() -> list[CustomerAccount]:
+    return list(CUSTOMER_ACCOUNTS.values())
+
+
+@app.get("/sensors", response_model=list[Sensor])
+def list_sensors() -> list[Sensor]:
+    return list(SENSORS.values())
 
 
 @app.post("/collection-requests/validate", response_model=ValidationResult)
@@ -796,7 +706,7 @@ def list_collection_requests() -> list[CollectionRequest]:
     cleanup_expired_records()
     return sorted(
         COLLECTION_REQUESTS.values(),
-        key=lambda request: request.updated_at,
+        key=lambda collection_request: collection_request.updated_at,
         reverse=True,
     )
 
@@ -842,59 +752,20 @@ def delete_collection_request(collection_request_id: str) -> DeleteResult:
     )
 
 
-@app.get("/orders", response_model=list[Order])
-def list_orders() -> list[Order]:
-    cleanup_expired_records()
-    return sorted(ORDERS.values(), key=lambda order: order.updated_at, reverse=True)
-
-
-@app.post("/orders", response_model=Order, status_code=status.HTTP_201_CREATED)
-def create_order(payload: CreateOrderPayload) -> Order:
-    cleanup_expired_records()
-    collection_request = get_collection_request_or_404(payload.collection_request_id)
-    validation = validate_collection_request(
-        collection_request_input_from_record(collection_request)
-    )
-    if not validation.allowed:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": "Collection request is no longer policy compliant.",
-                "violations": [violation.model_dump() for violation in validation.violations],
-            },
-        )
-
-    order = build_order(
+@app.post(
+    "/collection-requests/{collection_request_id}/simulate-tick",
+    response_model=CollectionRequest,
+)
+def simulate_tick(
+    collection_request_id: str,
+    payload: SimulateTickPayload | None = None,
+) -> CollectionRequest:
+    collection_request = get_collection_request_or_404(collection_request_id)
+    return advance_collection_request(
         collection_request,
-        source="user",
-        requested_by=payload.requested_by,
-        note=payload.note,
-    )
-    ORDERS[order.id] = order
-    return order
-
-
-@app.get("/orders/{order_id}", response_model=Order)
-def get_order(order_id: str) -> Order:
-    return get_order_or_404(order_id)
-
-
-@app.delete("/orders/{order_id}", response_model=DeleteResult)
-def delete_order(order_id: str) -> DeleteResult:
-    order = get_order_or_404(order_id)
-    del ORDERS[order.id]
-    return DeleteResult(deleted=True, id=order.id, resource="order")
-
-
-@app.post("/orders/{order_id}/simulate-tick", response_model=Order)
-def simulate_tick(order_id: str, payload: SimulateTickPayload | None = None) -> Order:
-    order = get_order_or_404(order_id)
-    updated_order = advance_order(
-        order,
         target_status=payload.target_status if payload else None,
         note=payload.note if payload else None,
     )
-    return updated_order
 
 
 @app.get("/docs/assignment")
@@ -902,41 +773,78 @@ def assignment_docs() -> dict[str, object]:
     return {
         "title": "OrbitalOps assignment guide",
         "overview": (
-            "This API simulates a satellite constellation company that validates "
-            "collection requests before turning them into trackable orders."
+            "This API simulates a satellite constellation company that validates and "
+            "tracks collection requests as a single workflow object."
         ),
         "objects": {
             "policy_profiles": {
                 "mutable": False,
                 "purpose": "Read-only policy rules that gate what each customer may request.",
             },
+            "customer_accounts": {
+                "mutable": False,
+                "purpose": "Read-only commercial accounts mapped to a default policy profile.",
+            },
+            "sensors": {
+                "mutable": False,
+                "purpose": "Read-only sensor catalog describing the imaging assets candidates can task.",
+            },
             "collection_requests": {
                 "mutable": True,
-                "purpose": "Validated imaging requests that can be turned into orders.",
-            },
-            "orders": {
-                "mutable": True,
-                "purpose": "Trackable commercial records with lifecycle status and event history.",
+                "purpose": (
+                    "A collection request is the main workflow object. It includes the "
+                    "commercial tracking fields that would normally live on an order."
+                ),
             },
         },
         "relationships": [
             "A customer account is assigned to a single policy profile.",
+            "A collection request chooses one sensor from the read-only sensor catalog.",
             "A collection request must use the customer account's assigned policy profile.",
-            "An order is created from an approved collection request and stores a full request snapshot.",
-            "Orders can advance through a status timeline for dashboards and workflow demos.",
+            "Collection requests move through an order-like lifecycle for demos and dashboards.",
+            "Reference data is immutable, while collection requests are session-scoped and mutable.",
         ],
+        "known_values": {
+            "priority": [priority.value for priority in Priority],
+            "delivery_format": [delivery_format.value for delivery_format in DeliveryFormat],
+            "collection_request_status": [
+                request_status.value for request_status in CollectionRequestStatus
+            ],
+        },
         "mutable_session_data": {
             "ttl_minutes": SESSION_TTL_MINUTES,
             "notes": [
-                "Seeded collection requests and orders are loaded when the app starts.",
-                "Collection requests and orders may be deleted or replaced during the exercise.",
+                "Seeded collection requests are loaded when the app starts.",
+                "Collection requests may be deleted or replaced during the exercise.",
                 "Reference data is hardcoded and exposed as read-only catalog data.",
             ],
         },
+        "starter_validation_examples": [
+            {
+                "name": "rush_not_allowed",
+                "description": "Fails because Civic Planning uses the standard policy and standard policy does not allow rush.",
+                "payload": {
+                    "customer_account_id": "acct-civic-planning",
+                    "policy_profile_id": "policy-commercial-standard",
+                    "sensor_id": "aurora-optical-wide",
+                    "priority": "rush",
+                    "delivery_format": "png_tiles",
+                    "acquisition_window_start": (utc_now() + timedelta(hours=5)).isoformat(),
+                    "acquisition_window_end": (utc_now() + timedelta(days=1)).isoformat(),
+                    "cloud_cover_max_pct": 20,
+                    "area_of_interest": {
+                        "name": "Seville emergency corridor",
+                        "center_lat": 37.38,
+                        "center_lon": -5.99,
+                        "area_sq_km": 95,
+                    },
+                },
+            }
+        ],
         "workflow": [
             {
                 "step": 1,
-                "action": "Inspect /reference-data and /policy-profiles to discover the allowed business context.",
+                "action": "Inspect /policy-profiles, /customer-accounts, and /sensors to discover the allowed business context.",
             },
             {
                 "step": 2,
@@ -948,31 +856,26 @@ def assignment_docs() -> dict[str, object]:
             },
             {
                 "step": 4,
-                "action": "Create a trackable order with POST /orders using a collection_request_id.",
+                "action": "Track progress with GET /collection-requests/{collection_request_id}.",
             },
             {
                 "step": 5,
-                "action": "Poll GET /orders or advance status with POST /orders/{order_id}/simulate-tick.",
+                "action": "Advance status with POST /collection-requests/{collection_request_id}/simulate-tick.",
             },
         ],
         "endpoints": [
             {"method": "GET", "path": "/", "description": "Service summary and useful links."},
-            {"method": "GET", "path": "/reference-data", "description": "Read-only startup catalog and example payloads."},
             {"method": "GET", "path": "/policy-profiles", "description": "List policy profiles."},
-            {"method": "GET", "path": "/policy-profiles/{policy_id}", "description": "Fetch one policy profile."},
+            {"method": "GET", "path": "/customer-accounts", "description": "List customer accounts and their default policy assignments."},
+            {"method": "GET", "path": "/sensors", "description": "List available imaging sensors."},
             {"method": "POST", "path": "/collection-requests/validate", "description": "Validate a collection request without persisting it."},
             {"method": "GET", "path": "/collection-requests", "description": "List session-scoped collection requests."},
             {"method": "POST", "path": "/collection-requests", "description": "Persist a policy-compliant collection request."},
-            {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request."},
+            {"method": "GET", "path": "/collection-requests/{collection_request_id}", "description": "Fetch one collection request including workflow status."},
             {"method": "DELETE", "path": "/collection-requests/{collection_request_id}", "description": "Delete a session collection request."},
-            {"method": "GET", "path": "/orders", "description": "List session-scoped orders."},
-            {"method": "POST", "path": "/orders", "description": "Create an order from a collection request."},
-            {"method": "GET", "path": "/orders/{order_id}", "description": "Fetch one order including its status history."},
-            {"method": "DELETE", "path": "/orders/{order_id}", "description": "Delete a session order."},
-            {"method": "POST", "path": "/orders/{order_id}/simulate-tick", "description": "Advance an order through the demo lifecycle."},
+            {"method": "POST", "path": "/collection-requests/{collection_request_id}/simulate-tick", "description": "Advance a collection request through the demo lifecycle."},
         ],
         "starter_demo_records": {
             "collection_request_ids": sorted(COLLECTION_REQUESTS.keys()),
-            "order_ids": sorted(ORDERS.keys()),
         },
     }
